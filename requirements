@@ -1,0 +1,8 @@
+panel
+folium
+geopandas
+pandas
+numpy
+shapely
+pyproj
+pyarrow
