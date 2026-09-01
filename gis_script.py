@@ -227,18 +227,45 @@ def list_spatial_files() -> List[Path]:
     return sorted([p for p in DATA_DIR.rglob("*") if p.is_file() and p.suffix.lower() in allowed])
 
 
+# Preference order when more than one file could satisfy the same logical
+# layer (e.g. a leftover "streetlights.shp" alongside a new
+# "streetlights.parquet" after converting to GeoParquet for faster loads
+# on Render). Lower index = preferred.
+PREFERRED_EXTENSION_ORDER = [".parquet", ".gpkg", ".geojson", ".json", ".shp", ".csv"]
+
+
 def find_layer(name: str) -> Optional[Path]:
     candidates = list_spatial_files()
     aliases = LAYER_ALIASES.get(name, [name])
 
-    # Exact-ish match first.
+    matches: List[Path] = []
     for alias in aliases:
         a = alias.lower().replace(" ", "_")
         for p in candidates:
             stem = p.stem.lower().replace(" ", "_")
             if stem == a or stem.startswith(a) or a in stem:
-                return p
-    return None
+                if p not in matches:
+                    matches.append(p)
+
+    if not matches:
+        return None
+
+    def _sort_key(path: Path) -> int:
+        ext = path.suffix.lower()
+        try:
+            return PREFERRED_EXTENSION_ORDER.index(ext)
+        except ValueError:
+            return len(PREFERRED_EXTENSION_ORDER)
+
+    matches.sort(key=_sort_key)
+
+    if len(matches) > 1:
+        print(
+            f"[INFO] Multiple candidate files found for layer '{name}': "
+            f"{[m.name for m in matches]}. Using '{matches[0].name}'."
+        )
+
+    return matches[0]
 
 
 def find_raster(*keywords: str) -> Optional[Path]:
