@@ -138,7 +138,18 @@ except Exception:
 # PANEL SETUP
 # ---------------------------------------------------------------------
 
-pn.extension("tabulator", notifications=True, sizing_mode="stretch_width")
+pn.extension(
+    "tabulator",
+    notifications=True,
+    sizing_mode="stretch_width",
+    defer_load=True,       # Send the page immediately; render bound/heavy
+                            # panels (map, tables, MCDA) after load instead
+                            # of blocking the initial HTML response.
+    loading_indicator=True,  # Show a spinner in place of each panel while
+                              # it's being computed, instead of a blank page.
+    throttled=True,         # Only recompute when a slider is released, not
+                            # on every intermediate value while dragging.
+)
 
 # ---------------------------------------------------------------------
 # PATHS / CONFIG
@@ -2225,32 +2236,72 @@ def get_active_weights() -> Dict[str, float]:
 # ---------------------------------------------------------------------
 
 def get_candidate_dataset() -> gpd.GeoDataFrame:
-    candidates = generate_road_based_candidates(
-        DATA.roads,
-        DATA.streetlights,
-        spacing_m=CANDIDATE_SPACING.value,
-        max_candidates=MAX_CANDIDATES.value,
-    )
-
-    features = build_candidate_features(
-        candidates,
-        DATA,
-        COVERAGE_RADIUS.value,
-    )
-
-    weights = get_active_weights()
-    scored = calculate_mcda(features, weights)
+    """
+    Thin wrapper around the cached pipeline. Building a hashable cache key
+    from the current widget values means that switching tabs (map,
+    analytics, budget, export) with unchanged settings hits the cache
+    instead of re-running candidate generation, feature engineering, MCDA
+    scoring and ML training from scratch every single time — this was the
+    main cause of slow browser load / slow tab switching.
+    """
+    weights_key = tuple(sorted(get_active_weights().items()))
 
     BUDGET.available_budget = float(budget_widget.value)
     BUDGET.unit_installation_cost = float(unit_cost_widget.value)
     BUDGET.contingency_percent = float(contingency_widget.value)
 
-    scored = implementation_plan(scored, BUDGET)
+    return _cached_candidate_dataset(
+        int(COVERAGE_RADIUS.value),
+        int(CANDIDATE_SPACING.value),
+        int(MAX_CANDIDATES.value),
+        str(scenario_widget.value),
+        float(budget_widget.value),
+        float(unit_cost_widget.value),
+        float(contingency_widget.value),
+        weights_key,
+    )
 
-    # Optional ML.
+
+@pn.cache(max_items=32, policy="LRU")
+def _cached_candidate_dataset(
+    coverage_radius: int,
+    spacing_m: int,
+    max_candidates: int,
+    scenario: str,
+    budget_value: float,
+    unit_cost: float,
+    contingency: float,
+    weights_key: Tuple[Tuple[str, float], ...],
+) -> gpd.GeoDataFrame:
+    candidates = generate_road_based_candidates(
+        DATA.roads,
+        DATA.streetlights,
+        spacing_m=spacing_m,
+        max_candidates=max_candidates,
+    )
+
+    features = build_candidate_features(
+        candidates,
+        DATA,
+        coverage_radius,
+    )
+
+    weights = dict(weights_key)
+    scored = calculate_mcda(features, weights)
+
+    budget_cfg = BudgetConfig(
+        available_budget=budget_value,
+        unit_installation_cost=unit_cost,
+        contingency_percent=contingency,
+    )
+    scored = implementation_plan(scored, budget_cfg)
+
+    # Optional ML — trained exactly once per unique cache key. analytics_view
+    # reuses this result via scored.attrs instead of retraining separately.
     ml_prob, ml_meta, ml_message = train_optional_ml(scored)
     scored["ml_probability"] = ml_prob.values
     scored["ml_message"] = ml_message
+    scored.attrs["ml_metadata"] = ml_meta
 
     scored["hybrid_score"] = np.round(
         0.80 * scored["overall_priority"]
@@ -2836,8 +2887,9 @@ def analytics_view(*_) -> pn.Column:
     )
 
     if SKLEARN_AVAILABLE and len(scored) >= 30:
-        # Run once to show available metadata.
-        prob, meta, msg = train_optional_ml(scored)
+        # Reuse the metadata already computed inside get_candidate_dataset()
+        # instead of re-training the RandomForest a second time here.
+        meta = scored.attrs.get("ml_metadata", {})
         if meta:
             ml_text.object += (
                 f"\n\n**Prototype validation metrics:** "
