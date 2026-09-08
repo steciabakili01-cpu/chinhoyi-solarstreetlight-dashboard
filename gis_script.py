@@ -24,6 +24,7 @@ A production-oriented prototype for the Municipality of Chinhoyi that combines:
 16. Maintenance / work-order tracking
 17. Community fault reporting
 18. CSV / GeoJSON / GeoPackage export
+19. "Ask the Dashboard" conversational assistant (retrieval-grounded)
 
 IMPORTANT
 ---------
@@ -58,7 +59,8 @@ Run:
 Main libraries:
     panel, folium, geopandas, pandas, numpy, shapely, pyproj
 Optional:
-    rasterio, scikit-learn, openpyxl
+    rasterio, scikit-learn, openpyxl, anthropic (for the chat assistant's
+    optional LLM phrasing layer -- the assistant works without it too)
 
 CHANGE LOG (bugfixes applied)
 ------------------------------
@@ -87,6 +89,11 @@ CHANGE LOG (bugfixes applied)
    columns rather than a GeoParquet with a geometry column, this branch
    falls back to building points from lon/lat columns the same way the
    `.csv` branch does.
+4. Added an "Ask the Dashboard" chat tab (see the CHATBOT ASSISTANT
+   section below). It answers strictly from data already computed by
+   this script (DATA store + get_candidate_dataset()); an optional LLM
+   layer (Anthropic API) only rephrases those retrieved facts and is
+   never allowed to invent numbers of its own.
 """
 
 from __future__ import annotations
@@ -95,12 +102,13 @@ import io
 import json
 import math
 import os
+import re
 import uuid
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -134,12 +142,22 @@ try:
 except Exception:
     SKLEARN_AVAILABLE = False
 
+try:
+    import anthropic
+    _ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
+    _LLM_AVAILABLE = bool(_ANTHROPIC_KEY)
+except Exception:
+    anthropic = None
+    _ANTHROPIC_KEY = None
+    _LLM_AVAILABLE = False
+
 # ---------------------------------------------------------------------
 # PANEL SETUP
 # ---------------------------------------------------------------------
 
 pn.extension(
     "tabulator",
+    "chat",
     notifications=True,
     sizing_mode="stretch_width",
     defer_load=True,       # Send the page immediately; render bound/heavy
@@ -3288,6 +3306,267 @@ priority class and implementation fields.
 
 
 # ---------------------------------------------------------------------
+# CHATBOT ASSISTANT ("Ask the Dashboard")
+# ---------------------------------------------------------------------
+#
+# Design principle: retrieval-first. Every fact the assistant states is
+# pulled live from DATA / get_candidate_dataset() / explain_site() -- the
+# same pipeline the rest of the dashboard uses. An optional LLM layer
+# (Anthropic API) may rephrase those retrieved facts into a nicer
+# sentence, but it is explicitly instructed never to add numbers of its
+# own. This keeps every chatbot answer traceable back to the MCDA/AHP
+# results for dissertation defensibility.
+
+def _phrase_with_llm(question: str, facts: str) -> Optional[str]:
+    """
+    Sends the user's question AND the already-retrieved facts to Claude,
+    strictly asking it to phrase (not invent) an answer. Returns None on
+    any failure so the caller falls back to the plain templated text.
+    """
+    if not _LLM_AVAILABLE:
+        return None
+
+    try:
+        client = anthropic.Anthropic(api_key=_ANTHROPIC_KEY)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=300,
+            system=(
+                "You are a helpful assistant embedded in a municipal solar "
+                "streetlight planning dashboard. You will be given a "
+                "planner's question and a set of FACTS already computed by "
+                "the dashboard's GIS/MCDA pipeline. Rephrase the facts into "
+                "a short, clear, friendly answer (2-4 sentences). "
+                "Do NOT add any numbers, statistics, or claims that are not "
+                "explicitly present in the FACTS. If the FACTS say data is "
+                "unavailable, say so plainly rather than guessing."
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Question: {question}\n\nFACTS:\n{facts}",
+                }
+            ],
+        )
+        return "".join(
+            block.text for block in response.content if block.type == "text"
+        ).strip()
+    except Exception:
+        return None
+
+
+class DashboardAssistant:
+    """
+    Retrieval-first assistant. Every method below pulls a real number from
+    the dashboard's own data/functions and returns it as a short fact
+    string. The chat callback matches user text to one of these handlers
+    via keyword patterns, then optionally asks the LLM layer to phrase it.
+    """
+
+    def __init__(
+        self,
+        get_candidate_dataset: Callable[[], "pd.DataFrame"],
+        data_store: DataStore,
+        coverage_percentage_fn: Callable,
+        explain_site_fn: Callable,
+        get_active_weights_fn: Callable[[], Dict[str, float]],
+        budget_widget,
+        unit_cost_widget,
+        contingency_widget,
+        coverage_radius_widget,
+    ):
+        self.get_candidate_dataset = get_candidate_dataset
+        self.data = data_store
+        self.coverage_percentage_fn = coverage_percentage_fn
+        self.explain_site_fn = explain_site_fn
+        self.get_active_weights_fn = get_active_weights_fn
+        self.budget_widget = budget_widget
+        self.unit_cost_widget = unit_cost_widget
+        self.contingency_widget = contingency_widget
+        self.coverage_radius_widget = coverage_radius_widget
+
+    def coverage(self) -> str:
+        pct = self.coverage_percentage_fn(
+            self.data.streetlights,
+            self.data.population,
+            self.coverage_radius_widget.value,
+        )
+        return (
+            f"Current lighting coverage is {pct:.1f}% of the population "
+            f"layer, within a {self.coverage_radius_widget.value} m service "
+            f"radius of existing streetlights."
+        )
+
+    def priority_counts(self) -> str:
+        scored = self.get_candidate_dataset()
+        counts = scored["priority_class"].value_counts()
+        return (
+            f"Of {len(scored)} candidate sites under the current scenario: "
+            f"{int(counts.get('HIGH', 0))} HIGH, "
+            f"{int(counts.get('MEDIUM', 0))} MEDIUM, "
+            f"{int(counts.get('LOW', 0))} LOW priority."
+        )
+
+    def top_site(self) -> str:
+        scored = self.get_candidate_dataset()
+        if scored.empty:
+            return "No candidate sites are available yet."
+        row = scored.iloc[0]
+        return (
+            f"The top-ranked candidate is {row['candidate_id']} "
+            f"(rank 1, overall priority {row['overall_priority']:.1f}/100, "
+            f"on {row.get('road_name', 'an unmapped road')})."
+        )
+
+    def explain_rank(self, rank: int) -> str:
+        scored = self.get_candidate_dataset()
+        match = scored[scored["rank"] == rank]
+        if match.empty:
+            return f"No candidate exists at rank {rank} in the current results."
+        row = match.iloc[0]
+        exp = self.explain_site_fn(row, self.get_active_weights_fn())
+        if exp.empty:
+            return f"Rank {rank} is {row['candidate_id']}, but no factor breakdown is available."
+        top_factors = ", ".join(
+            f"{r.factor} ({r.contribution_percent:.0f}%)"
+            for r in exp.head(3).itertuples()
+        )
+        return (
+            f"Rank {rank} is {row['candidate_id']} "
+            f"(overall priority {row['overall_priority']:.1f}/100). "
+            f"The largest contributing factors are: {top_factors}."
+        )
+
+    def maintenance_status(self) -> str:
+        if self.data.maintenance.empty:
+            return "No maintenance/asset data is currently loaded."
+        counts = self.data.maintenance["status"].value_counts()
+        parts = ", ".join(f"{v} {k}" for k, v in counts.items())
+        return f"Current asset status across {len(self.data.maintenance)} streetlights: {parts}."
+
+    def budget_summary(self) -> str:
+        scored = self.get_candidate_dataset()
+        phase1 = scored[scored["funded_phase_1"]] if "funded_phase_1" in scored.columns else scored.iloc[0:0]
+        total_cost = float(phase1["estimated_cost"].sum()) if not phase1.empty else 0.0
+        return (
+            f"With a budget of ${self.budget_widget.value:,.0f} and a unit "
+            f"cost of ${self.unit_cost_widget.value:,.0f} "
+            f"(+{self.contingency_widget.value:.0f}% contingency), "
+            f"{len(phase1)} sites are funded in Phase 1, costing "
+            f"${total_cost:,.0f} in total."
+        )
+
+    def help_text(self) -> str:
+        return (
+            "I can answer questions like: 'what is our coverage?', "
+            "'how many high priority sites are there?', "
+            "'explain rank 3', 'maintenance status', or 'budget summary'. "
+            "I only report numbers already computed by this dashboard's "
+            "GIS/MCDA pipeline -- I don't estimate or guess."
+        )
+
+
+_RANK_PATTERN = re.compile(r"rank\s*#?\s*(\d+)", re.IGNORECASE)
+
+
+def _route_question(assistant: "DashboardAssistant", text: str) -> str:
+    t = text.lower().strip()
+
+    rank_match = _RANK_PATTERN.search(t)
+    if rank_match:
+        return assistant.explain_rank(int(rank_match.group(1)))
+
+    if any(k in t for k in ["coverage", "covered", "% lit", "percent lit"]):
+        return assistant.coverage()
+
+    if any(k in t for k in ["how many high", "high priority", "priority count", "priority sites"]):
+        return assistant.priority_counts()
+
+    if any(k in t for k in ["top site", "best site", "highest ranked", "#1", "rank 1"]):
+        return assistant.top_site()
+
+    if any(k in t for k in ["maintenance", "faulty", "offline", "operational status"]):
+        return assistant.maintenance_status()
+
+    if any(k in t for k in ["budget", "cost", "afford", "phase 1"]):
+        return assistant.budget_summary()
+
+    if any(k in t for k in ["help", "what can you do", "how do i", "hi", "hello"]):
+        return assistant.help_text()
+
+    return (
+        "I'm not sure how to answer that from the current dashboard data. "
+        + assistant.help_text()
+    )
+
+
+def build_chat_tab() -> pn.Column:
+    """
+    Builds the 'Ask the Dashboard' tab. Reuses the same DATA store,
+    get_candidate_dataset(), explain_site(), get_active_weights() and
+    budget widgets already defined above in this module.
+    """
+
+    assistant = DashboardAssistant(
+        get_candidate_dataset=get_candidate_dataset,
+        data_store=DATA,
+        coverage_percentage_fn=coverage_percentage,
+        explain_site_fn=explain_site,
+        get_active_weights_fn=get_active_weights,
+        budget_widget=budget_widget,
+        unit_cost_widget=unit_cost_widget,
+        contingency_widget=contingency_widget,
+        coverage_radius_widget=COVERAGE_RADIUS,
+    )
+
+    def callback(contents: str, user: str, instance: pn.chat.ChatInterface):
+        facts = _route_question(assistant, contents)
+        phrased = _phrase_with_llm(contents, facts)
+        return phrased or facts
+
+    chat_interface = pn.chat.ChatInterface(
+        callback=callback,
+        callback_user="Dashboard Assistant",
+        show_clear=True,
+        show_undo=False,
+        sizing_mode="stretch_width",
+        height=520,
+    )
+
+    chat_interface.send(
+        "Hi! I'm the dashboard assistant. Ask me about coverage, "
+        "priority sites, maintenance status, or budget -- I answer "
+        "using the same live data as the rest of this dashboard. "
+        "Type 'help' any time.",
+        user="Dashboard Assistant",
+        respond=False,
+    )
+
+    status = pn.pane.Markdown(
+        "*LLM phrasing layer: "
+        + ("ENABLED (ANTHROPIC_API_KEY detected)" if _LLM_AVAILABLE else "OFFLINE -- using templated answers only")
+        + "*",
+        styles={"font-size": "11px", "color": "#64748b"},
+    )
+
+    return pn.Column(
+        pn.pane.Markdown("## 🤖 Ask the Dashboard"),
+        pn.pane.Markdown(
+            "Ask questions in plain language about coverage, priority "
+            "sites, maintenance, or budget. Answers are generated from "
+            "this session's live MCDA/AHP results, not from an external "
+            "knowledge source."
+        ),
+        status,
+        chat_interface,
+        sizing_mode="stretch_width",
+    )
+
+
+chat_tab = build_chat_tab()
+
+
+# ---------------------------------------------------------------------
 # FULL APPLICATION
 # ---------------------------------------------------------------------
 
@@ -3349,6 +3628,7 @@ application = pn.template.FastListTemplate(
             ("👥 Community Reporting", community_tab),
             ("🧪 Data Readiness", data_quality_tab),
             ("📤 Export", export_tab),
+            ("🤖 Ask the Dashboard", chat_tab),
             dynamic=True,
         )
     ],
@@ -3373,6 +3653,11 @@ if DEMO_WARNING:
     print("   Replace missing datasets before using results for planning.")
 else:
     print("\n✅ Core real-data layers detected.")
+
+print(
+    "\nChat assistant LLM phrasing layer: "
+    + ("ENABLED" if _LLM_AVAILABLE else "OFFLINE (templated answers only)")
+)
 
 # IMPORTANT: application.servable() must run unconditionally at module level.
 # `panel serve` imports/executes this script but does NOT run it as
