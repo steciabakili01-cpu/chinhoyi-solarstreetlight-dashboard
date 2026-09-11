@@ -157,7 +157,6 @@ except Exception:
 
 pn.extension(
     "tabulator",
-    "chat",
     notifications=True,
     sizing_mode="stretch_width",
     defer_load=True,       # Send the page immediately; render bound/heavy
@@ -167,6 +166,74 @@ pn.extension(
                               # it's being computed, instead of a blank page.
     throttled=True,         # Only recompute when a slider is released, not
                             # on every intermediate value while dragging.
+    raw_css=[
+        """
+        /* ==========================================================
+           RESPONSIVE LAYOUT (laptop / tablet / smartphone)
+           ==========================================================
+           Strategy: prefer fluid CSS (flex auto-wrap + clamp()) over
+           fixed pixel breakpoints, so the layout adapts continuously
+           across screen sizes rather than snapping at 1-2 widths.
+           FastListTemplate already collapses the sidebar into a
+           hamburger drawer below its own breakpoint; everything below
+           handles the *content* area, which Panel does not make fluid
+           by default. */
+
+        /* 1. Any Row of cards/controls wraps and each child claims a
+              flexible share with a sensible minimum, so the browser
+              decides how many fit per line at any width. */
+        .bk-panel-models-layout-Row {
+            flex-wrap: wrap !important;
+            row-gap: 10px;
+        }
+        .bk-panel-models-layout-Row > * {
+            flex: 1 1 210px !important;
+            min-width: 0 !important;
+        }
+
+        /* 2. On very narrow phones, force a single column for
+              readability (cards/controls that would otherwise squeeze
+              below ~210px). */
+        @media (max-width: 480px) {
+            .bk-panel-models-layout-Row > * {
+                flex: 1 1 100% !important;
+            }
+        }
+
+        /* 3. The Folium map: fluid height via viewport units instead of
+              a single fixed pixel value, so it uses more of the screen
+              on tall phones and less on short laptop windows. */
+        .gis-map-pane, .gis-map-pane > div, .gis-map-pane iframe {
+            width: 100% !important;
+            height: clamp(320px, 62vh, 640px) !important;
+        }
+
+        /* 4. Tables/Tabulators scroll horizontally instead of
+              squashing columns unreadably on phones. */
+        .tabulator {
+            overflow-x: auto !important;
+            font-size: clamp(11px, 1.6vw, 13px) !important;
+        }
+
+        /* 5. Fluid type scale for headers and KPI values so text never
+              overflows a card on a small screen. */
+        .gis-header-title {
+            font-size: clamp(15px, 3.2vw, 21px) !important;
+        }
+        .gis-header-subtitle {
+            font-size: clamp(10px, 2vw, 13px) !important;
+        }
+        .gis-kpi-value {
+            font-size: clamp(17px, 2.6vw, 23px) !important;
+        }
+
+        /* 6. Sidebar controls: prevent number inputs/sliders from
+              overflowing their container on narrow drawers. */
+        .bk-panel-models-layout-Column {
+            max-width: 100%;
+        }
+        """
+    ],
 )
 
 # ---------------------------------------------------------------------
@@ -197,9 +264,12 @@ COLOR_MUNI_GOLD = "#FDB913"
 COLOR_CUT_NAVY = "#002147"
 COLOR_CUT_GOLD = "#D4AF37"
 
+COLOR_VERY_HIGH = "#991B1B"
 COLOR_HIGH = "#DC2626"
 COLOR_MED = "#EA580C"
+COLOR_MODERATE = "#F59E0B"
 COLOR_LOW = "#16A34A"
+COLOR_UNSUITABLE = "#6B7280"
 COLOR_INFO = "#2563EB"
 COLOR_FAULT = "#991B1B"
 COLOR_MAINT = "#D97706"
@@ -1191,6 +1261,91 @@ def coverage_percentage(
     return 100.0 * covered / max(len(pop), 1)
 
 
+def coverage_breakdown(
+    existing_lights: Optional[gpd.GeoDataFrame],
+    population: Optional[gpd.GeoDataFrame],
+    full_radius_m: float = 75,
+    partial_radius_m: float = 150,
+) -> Dict[str, float]:
+    """
+    Three-tier coverage classification against a population layer:
+      - Covered:            within full_radius_m of an existing light
+      - Partially covered:  beyond full_radius_m but within partial_radius_m
+      - Poorly covered:     beyond partial_radius_m of every existing light
+
+    Returns percentages that sum to ~100 (subject to rounding), plus the
+    raw population count used as the denominator so callers can display
+    both the percentage and the underlying sample size.
+    """
+    empty_result = {
+        "covered_pct": 0.0,
+        "partial_pct": 0.0,
+        "poor_pct": 100.0,
+        "population_points": 0,
+    }
+
+    if population is None or population.empty:
+        return empty_result
+
+    pop = population.copy()
+    pop["geometry"] = pop.geometry.apply(representative_point)
+    pop = pop[pop.geometry.notna()].to_crs(UTM)
+
+    if pop.empty:
+        return empty_result
+
+    if existing_lights is None or existing_lights.empty:
+        empty_result["population_points"] = len(pop)
+        return empty_result
+
+    lights = existing_lights.copy()
+    lights = lights[lights.geometry.notna()]
+    lights = lights[~lights.geometry.is_empty]
+    lights = lights.to_crs(UTM)
+
+    if lights.empty:
+        empty_result["population_points"] = len(pop)
+        return empty_result
+
+    full_union = unary_union([g.buffer(full_radius_m) for g in lights.geometry])
+    partial_union = unary_union([g.buffer(partial_radius_m) for g in lights.geometry])
+
+    n = len(pop)
+    covered = sum(bool(geom.within(full_union)) for geom in pop.geometry)
+    within_partial = sum(bool(geom.within(partial_union)) for geom in pop.geometry)
+    partial_only = max(within_partial - covered, 0)
+    poor = max(n - covered - partial_only, 0)
+
+    return {
+        "covered_pct": round(100.0 * covered / max(n, 1), 1),
+        "partial_pct": round(100.0 * partial_only / max(n, 1), 1),
+        "poor_pct": round(100.0 * poor / max(n, 1), 1),
+        "population_points": n,
+    }
+
+
+def combined_light_points(
+    existing_lights: Optional[gpd.GeoDataFrame],
+    extra_candidates: Optional[gpd.GeoDataFrame],
+) -> Optional[gpd.GeoDataFrame]:
+    """
+    Concatenates existing streetlight points with a set of proposed
+    candidate points (both already in WGS84), for use by the What-if
+    planning tool when simulating coverage after N new installations.
+    Returns None only if both inputs are empty/missing.
+    """
+    frames = []
+    if existing_lights is not None and not existing_lights.empty:
+        frames.append(existing_lights[["geometry"]])
+    if extra_candidates is not None and not extra_candidates.empty:
+        frames.append(extra_candidates[["geometry"]])
+
+    if not frames:
+        return None
+
+    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=WGS84)
+
+
 # ---------------------------------------------------------------------
 # AHP / MCDA
 # ---------------------------------------------------------------------
@@ -1241,21 +1396,33 @@ def calculate_mcda(
             continue
         score += normalize_series(out[key]).to_numpy() * (float(weight) / total)
 
+    # Safety/priority analysis (item: "Combine population, roads, public
+    # facilities, bus stops and crime/safety data to determine priority
+    # areas"). All five named factors are explicit terms here -- roads
+    # and bus-stop proximity were previously only folded into the overall
+    # MCDA score, not into the safety sub-score specifically. Weights
+    # still sum to 1.0.
     out["safety_score"] = (
         normalize_series(
             out.get("population", pd.Series(0, index=out.index))
-        ) * 0.32
+        ) * 0.25
         + normalize_series(
             out.get("lighting_gap", pd.Series(0, index=out.index))
-        ) * 0.22
+        ) * 0.15
         + normalize_series(
             out.get("pedestrian", pd.Series(0, index=out.index))
-        ) * 0.16
+        ) * 0.10
         + normalize_series(
             out.get("crime", pd.Series(0, index=out.index))
         ) * 0.20
         + normalize_series(
             out.get("facilities", pd.Series(0, index=out.index))
+        ) * 0.10
+        + normalize_series(
+            out.get("road", pd.Series(0, index=out.index))
+        ) * 0.10
+        + normalize_series(
+            out.get("bus", pd.Series(0, index=out.index))
         ) * 0.10
     )
 
@@ -1292,13 +1459,24 @@ def calculate_mcda(
 
     out["rank"] = np.arange(1, len(out) + 1)
 
+    # Five-tier classification (item: "Smart site-selection tool" --
+    # identify and rank locations, with finer-grained priority bands
+    # than a flat High/Medium/Low so planners can distinguish urgent
+    # sites from merely "worth watching" ones):
+    #   >=85  VERY HIGH   -- install first
+    #   >=70  HIGH        -- install in near-term phases
+    #   >=50  MODERATE    -- worth watching, lower urgency
+    #   >=30  LOW         -- limited justification currently
+    #   <30   UNSUITABLE  -- does not meet minimum planning criteria
     out["priority_class"] = np.select(
         [
-            out["overall_priority"] >= 75,
+            out["overall_priority"] >= 85,
+            out["overall_priority"] >= 70,
             out["overall_priority"] >= 50,
+            out["overall_priority"] >= 30,
         ],
-        ["HIGH", "MEDIUM"],
-        default="LOW",
+        ["VERY HIGH", "HIGH", "MODERATE", "LOW"],
+        default="UNSUITABLE",
     )
 
     return out
@@ -1820,22 +1998,40 @@ def create_map(
 
         existing_fg.add_to(m)
 
-    # Coverage circles.
+    # Coverage circles: three-tier Covered / Partially covered / Poorly
+    # covered rings around each existing light, rather than a single
+    # uniform buffer. The outer ring is drawn first so the inner
+    # (fully-covered) ring layers on top of it.
     if show_coverage and store.streetlights is not None and not store.streetlights.empty:
         coverage_fg = folium.FeatureGroup(
-            name="Lighting Service Coverage (75 m)",
+            name="Lighting Coverage (Covered / Partial / Poor)",
             show=False,
         )
 
         for geom in store.streetlights.geometry:
             folium.Circle(
                 location=[geom.y, geom.x],
-                radius=75,
-                color=COLOR_INFO,
+                radius=150,
+                color=COLOR_MED,
                 fill=True,
-                fill_opacity=0.04,
+                fill_color=COLOR_MED,
+                fill_opacity=0.05,
                 opacity=0.25,
                 weight=1,
+                tooltip="Partially covered zone (75-150 m)",
+            ).add_to(coverage_fg)
+
+        for geom in store.streetlights.geometry:
+            folium.Circle(
+                location=[geom.y, geom.x],
+                radius=75,
+                color=COLOR_LOW,
+                fill=True,
+                fill_color=COLOR_LOW,
+                fill_opacity=0.10,
+                opacity=0.35,
+                weight=1,
+                tooltip="Covered zone (0-75 m)",
             ).add_to(coverage_fg)
 
         coverage_fg.add_to(m)
@@ -1985,15 +2181,21 @@ def create_map(
     for _, row in scored.iterrows():
         pclass = row["priority_class"]
 
-        if pclass == "HIGH":
+        if pclass == "VERY HIGH":
+            color = COLOR_VERY_HIGH
+            radius = 10
+        elif pclass == "HIGH":
             color = COLOR_HIGH
-            radius = 9
-        elif pclass == "MEDIUM":
-            color = COLOR_MED
+            radius = 8
+        elif pclass == "MODERATE":
+            color = COLOR_MODERATE
             radius = 7
-        else:
+        elif pclass == "LOW":
             color = COLOR_LOW
             radius = 5
+        else:
+            color = COLOR_UNSUITABLE
+            radius = 4
 
         folium.CircleMarker(
             location=[row.geometry.y, row.geometry.x],
@@ -2064,11 +2266,15 @@ def create_map(
         Solar Streetlight Priority
       </b><br><br>
       <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
+        background:{COLOR_VERY_HIGH};"></span> Very High priority<br>
+      <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
         background:{COLOR_HIGH};"></span> High priority<br>
       <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
-        background:{COLOR_MED};"></span> Medium priority<br>
+        background:{COLOR_MODERATE};"></span> Moderate priority<br>
       <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
-        background:{COLOR_LOW};"></span> Low priority<br><br>
+        background:{COLOR_LOW};"></span> Low priority<br>
+      <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
+        background:{COLOR_UNSUITABLE};"></span> Unsuitable<br><br>
       <b>Existing assets</b><br>
       <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
         background:{COLOR_EXISTING};"></span> Operational<br>
@@ -2077,7 +2283,14 @@ def create_map(
       <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
         background:{COLOR_MAINT};"></span> Maintenance<br>
       <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
-        background:{COLOR_OFFLINE};"></span> Offline
+        background:{COLOR_OFFLINE};"></span> Offline<br><br>
+      <b>Coverage (toggle layer)</b><br>
+      <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
+        background:{COLOR_LOW};opacity:0.6;"></span> Covered (0-75 m)<br>
+      <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
+        background:{COLOR_MED};opacity:0.4;"></span> Partial (75-150 m)<br>
+      <span style="display:inline-block;width:11px;height:11px;border-radius:50%;
+        background:#ffffff;border:1px solid #cbd5e1;"></span> Poor (&gt;150 m)
     </div>
     """
 
@@ -2341,11 +2554,13 @@ def kpi_card(title: str, value, subtitle: str = "", accent: str = COLOR_CUT_NAVY
       border:1px solid #e2e8f0;
       border-radius:10px;
       padding:12px;
-      min-height:85px;">
+      min-height:85px;
+      width:100%;
+      box-sizing:border-box;">
       <div style="font-size:11px;color:#64748b;text-transform:uppercase;">
         {title}
       </div>
-      <div style="font-size:23px;font-weight:700;color:{accent};margin-top:4px;">
+      <div class="gis-kpi-value" style="font-weight:700;color:{accent};margin-top:4px;">
         {value}
       </div>
       <div style="font-size:10px;color:#64748b;margin-top:3px;">
@@ -2367,7 +2582,7 @@ def build_kpis(scored: gpd.GeoDataFrame) -> pn.Row:
     else:
         operational = faulty = maintenance_count = offline = 0
 
-    high_priority = int((scored["priority_class"] == "HIGH").sum())
+    high_priority = int(scored["priority_class"].isin(["VERY HIGH", "HIGH"]).sum())
 
     coverage = coverage_percentage(
         DATA.streetlights,
@@ -2454,6 +2669,63 @@ def source_status_table() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def data_quality_score() -> Dict[str, object]:
+    """
+    Produces a single overall "Data Quality" percentage plus the checks
+    behind it, for display at the top of the Data Readiness tab. This is
+    a transparent, rule-based score (not a black box):
+
+      - 60% of the score: proportion of the 12 recognised layers/rasters
+        that are present (DATA_SOURCE_FLAGS).
+      - 25% of the score: streetlight attribute completeness (no missing
+        asset_id, no duplicate asset_id).
+      - 15% of the score: no null/empty geometries survived into the
+        streetlights layer (ensure_point_layer() should already guarantee
+        this, but we verify rather than assume).
+    """
+    total_layers = len(DATA_SOURCE_FLAGS)
+    available_layers = sum(1 for v in DATA_SOURCE_FLAGS.values() if v)
+    layer_score = available_layers / max(total_layers, 1)
+
+    duplicate_ids = 0
+    missing_ids = 0
+    null_geoms = 0
+    n_lights = 0
+
+    if DATA.streetlights is not None and not DATA.streetlights.empty:
+        n_lights = len(DATA.streetlights)
+        if "asset_id" in DATA.streetlights.columns:
+            ids = DATA.streetlights["asset_id"]
+            missing_ids = int(ids.isna().sum())
+            duplicate_ids = int(ids.duplicated().sum())
+        null_geoms = int(DATA.streetlights.geometry.isna().sum())
+
+    attribute_score = 1.0
+    if n_lights:
+        attribute_score = max(
+            0.0,
+            1.0 - (missing_ids + duplicate_ids) / max(n_lights, 1),
+        )
+
+    geometry_score = 1.0 if n_lights == 0 else max(0.0, 1.0 - null_geoms / n_lights)
+
+    overall = round(
+        100 * (0.60 * layer_score + 0.25 * attribute_score + 0.15 * geometry_score),
+        1,
+    )
+
+    return {
+        "overall_pct": overall,
+        "available_layers": available_layers,
+        "total_layers": total_layers,
+        "duplicate_ids": duplicate_ids,
+        "missing_ids": missing_ids,
+        "null_geoms": null_geoms,
+        "n_lights": n_lights,
+        "is_demo": DEMO_WARNING,
+    }
+
+
 # ---------------------------------------------------------------------
 # CHART DATA
 # ---------------------------------------------------------------------
@@ -2462,7 +2734,7 @@ def priority_summary(scored: gpd.GeoDataFrame) -> pd.DataFrame:
     out = (
         scored["priority_class"]
         .value_counts()
-        .reindex(["HIGH", "MEDIUM", "LOW"], fill_value=0)
+        .reindex(["VERY HIGH", "HIGH", "MODERATE", "LOW", "UNSUITABLE"], fill_value=0)
         .rename_axis("Priority")
         .reset_index(name="Sites")
     )
@@ -2631,10 +2903,10 @@ maintenance_tabulator = pn.widgets.Tabulator(
     page_size=10,
     height=360,
     editors={
-        "status": {"type": "select", "options": ["Operational", "Faulty", "Maintenance", "Offline"]},
+        "status": {"type": "list", "values": ["Operational", "Faulty", "Maintenance", "Offline"]},
         "fault_type": {
-            "type": "select",
-            "options": ["None", "Battery", "Lamp/LED", "Solar Panel", "Controller", "Pole", "Unknown"],
+            "type": "list",
+            "values": ["None", "Battery", "Lamp/LED", "Solar Panel", "Controller", "Pole", "Unknown"],
         },
     },
 )
@@ -2699,6 +2971,7 @@ def build_main_view() -> pn.Column:
         m._repr_html_(),
         height=620,
         sizing_mode="stretch_width",
+        css_classes=["gis-map-pane"],
     )
 
     # Ranked table.
@@ -2725,13 +2998,71 @@ def build_main_view() -> pn.Column:
 
     display_cols = [c for c in display_cols if c in scored.columns]
 
+    # --- Search & filtering (item: "Search & filtering by suburb, street,
+    # light ID, status, condition and priority") ---
+    search_widget = pn.widgets.TextInput(
+        name="🔎 Search road / candidate ID",
+        placeholder="e.g. Ring Road or CSL-0012",
+        sizing_mode="stretch_width",
+    )
+    priority_filter_widget = pn.widgets.Select(
+        name="Priority filter",
+        options=["All", "VERY HIGH", "HIGH", "MODERATE", "LOW", "UNSUITABLE"],
+        value="All",
+        width=160,
+    )
+    phase_filter_widget = pn.widgets.Select(
+        name="Implementation phase",
+        options=["All"] + (
+            sorted(scored["implementation_phase"].unique().tolist())
+            if "implementation_phase" in scored.columns
+            else []
+        ),
+        value="All",
+        width=220,
+    )
+
+    def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+        out = df
+        text = search_widget.value.strip().lower()
+        if text:
+            mask = pd.Series(False, index=out.index)
+            if "road_name" in out.columns:
+                mask = mask | out["road_name"].astype(str).str.lower().str.contains(text, na=False)
+            if "candidate_id" in out.columns:
+                mask = mask | out["candidate_id"].astype(str).str.lower().str.contains(text, na=False)
+            out = out[mask]
+        if priority_filter_widget.value != "All" and "priority_class" in out.columns:
+            out = out[out["priority_class"] == priority_filter_widget.value]
+        if phase_filter_widget.value != "All" and "implementation_phase" in out.columns:
+            out = out[out["implementation_phase"] == phase_filter_widget.value]
+        return out
+
     table = pn.widgets.Tabulator(
-        pd.DataFrame(scored[display_cols]),
+        pd.DataFrame(apply_filters(scored)[display_cols]),
         pagination="remote",
         page_size=12,
         height=420,
         selectable=1,
         show_index=False,
+    )
+
+    filtered_ref = {"df": apply_filters(scored)}
+
+    def _refresh_table(event=None):
+        filtered = apply_filters(scored)
+        filtered_ref["df"] = filtered
+        table.value = pd.DataFrame(filtered[display_cols])
+
+    search_widget.param.watch(_refresh_table, "value")
+    priority_filter_widget.param.watch(_refresh_table, "value")
+    phase_filter_widget.param.watch(_refresh_table, "value")
+
+    filter_row = pn.Row(
+        search_widget,
+        priority_filter_widget,
+        phase_filter_widget,
+        sizing_mode="stretch_width",
     )
 
     # Explanation panel.
@@ -2748,7 +3079,10 @@ def build_main_view() -> pn.Column:
             return
 
         idx = table.selection[0]
-        selected = scored.iloc[idx]
+        current_view = filtered_ref["df"].reset_index(drop=True)
+        if idx >= len(current_view):
+            return
+        selected = current_view.iloc[idx]
 
         exp = explain_site(selected, get_active_weights())
 
@@ -2793,6 +3127,7 @@ def build_main_view() -> pn.Column:
         map_pane,
         pn.layout.Divider(),
         pn.pane.Markdown("### 🏆 Ranked Candidate Sites"),
+        filter_row,
         table,
         explanation,
         sizing_mode="stretch_width",
@@ -2824,10 +3159,10 @@ def reactive_dashboard(*_):
             color:white;
             border-radius:9px;
             padding:16px 20px;">
-            <div style="font-size:21px;font-weight:800;">
+            <div class="gis-header-title" style="font-weight:800;">
                 🏛️ MUNICIPALITY OF CHINHOYI
             </div>
-            <div style="font-size:13px;opacity:0.9;">
+            <div class="gis-header-subtitle" style="opacity:0.9;">
                 GIS & Geoinformatics Section —
                 Smart Solar Streetlight Planning, Monitoring & Decision Support
             </div>
@@ -3012,6 +3347,27 @@ weights should ideally come from a documented pairwise-comparison AHP process
 and should be checked using the AHP Consistency Ratio.
 
 **Rule used here:** `CR < 0.10` is normally treated as reasonably consistent.
+
+### Safety / Priority Analysis formula
+
+The **safety score** shown on each candidate site combines five factors,
+answering "how much does this location need better lighting for safety
+reasons?":
+
+| Factor | Weight |
+| --- | --- |
+| Population pressure | 25% |
+| Safety / crime risk | 20% |
+| Lighting gap (distance from existing lights) | 15% |
+| Public facility proximity | 10% |
+| Road hierarchy/importance | 10% |
+| Bus-stop proximity | 10% |
+| Pedestrian activity | 10% |
+
+The **overall priority** score is `65% safety score + 35% technical score`
+(solar potential, terrain, environmental suitability, maintenance access),
+and is classified into five bands: **Very High (≥85) → High (≥70) →
+Moderate (≥50) → Low (≥30) → Unsuitable (<30)**.
 """
     ),
     scenario_widget,
@@ -3021,9 +3377,151 @@ and should be checked using the AHP Consistency Ratio.
 )
 
 
+def build_asset_registry() -> pd.DataFrame:
+    """
+    Consolidated Streetlight Asset Registry (item: "Streetlight asset
+    management" -- show every existing light with ID, location, status,
+    type, installation date, condition, etc.) Joins the streetlights
+    layer with the maintenance table on asset_id and derives a simple,
+    transparent "condition" rating so the table answers "what state is
+    this specific asset in?" in one place, rather than requiring a user
+    to cross-reference the map and the maintenance tab separately.
+
+    Condition rule (explainable, not a black box):
+      - Base condition comes directly from operational status:
+            Operational -> Good, Maintenance -> Fair,
+            Faulty -> Poor, Offline -> Critical, unknown -> Unknown
+      - If the asset is more than 5 years old, condition is downgraded
+        one tier (ages the "Good" bucket into "Fair", etc.) to reflect
+        that ageing solar hardware degrades even while nominally
+        operational. This is a simple heuristic for the prototype --
+        swap in real inspection data once available.
+    """
+    if DATA.streetlights is None or DATA.streetlights.empty:
+        return pd.DataFrame(
+            columns=[
+                "asset_id", "latitude", "longitude", "light_type",
+                "installation_year", "age_years", "status", "fault_type",
+                "condition", "assigned_to", "repair_date",
+            ]
+        )
+
+    lights = DATA.streetlights.copy()
+    lights["latitude"] = lights.geometry.y.round(6)
+    lights["longitude"] = lights.geometry.x.round(6)
+
+    keep_cols = ["asset_id", "latitude", "longitude"]
+    for optional_col in ["light_type", "installation_year", "road_id"]:
+        if optional_col in lights.columns:
+            keep_cols.append(optional_col)
+
+    registry = pd.DataFrame(lights[keep_cols])
+
+    if "installation_year" in registry.columns:
+        current_year = datetime.now().year
+        registry["age_years"] = pd.to_numeric(
+            registry["installation_year"], errors="coerce"
+        ).apply(lambda y: (current_year - int(y)) if pd.notna(y) else np.nan)
+    else:
+        registry["age_years"] = np.nan
+
+    if not DATA.maintenance.empty:
+        maint_cols = [
+            c for c in [
+                "asset_id", "status", "fault_type", "assigned_to", "repair_date",
+            ]
+            if c in DATA.maintenance.columns
+        ]
+        registry = registry.merge(
+            DATA.maintenance[maint_cols], on="asset_id", how="left"
+        )
+    else:
+        registry["status"] = "Unknown"
+        registry["fault_type"] = "Unknown"
+        registry["assigned_to"] = "Unassigned"
+        registry["repair_date"] = None
+
+    registry["status"] = registry["status"].fillna("Unknown")
+
+    base_condition = {
+        "Operational": "Good",
+        "Maintenance": "Fair",
+        "Faulty": "Poor",
+        "Offline": "Critical",
+    }
+    downgrade = {"Good": "Fair", "Fair": "Poor", "Poor": "Critical", "Critical": "Critical"}
+
+    def _condition(row) -> str:
+        cond = base_condition.get(row["status"], "Unknown")
+        age = row.get("age_years", np.nan)
+        if cond != "Unknown" and pd.notna(age) and age > 5:
+            cond = downgrade[cond]
+        return cond
+
+    registry["condition"] = registry.apply(_condition, axis=1)
+
+    return registry
+
+
 # ---------------------------------------------------------------------
 # ASSET MONITORING TAB
 # ---------------------------------------------------------------------
+
+asset_search_widget = pn.widgets.TextInput(
+    name="🔎 Search asset ID",
+    placeholder="e.g. SL-CHN-0032",
+    sizing_mode="stretch_width",
+)
+asset_status_filter = pn.widgets.Select(
+    name="Status",
+    options=["All", "Operational", "Faulty", "Maintenance", "Offline", "Unknown"],
+    value="All",
+    width=160,
+)
+asset_condition_filter = pn.widgets.Select(
+    name="Condition",
+    options=["All", "Good", "Fair", "Poor", "Critical", "Unknown"],
+    value="All",
+    width=160,
+)
+
+
+def _filtered_asset_registry() -> pd.DataFrame:
+    df = build_asset_registry()
+    text = asset_search_widget.value.strip().lower()
+    if text and "asset_id" in df.columns:
+        df = df[df["asset_id"].astype(str).str.lower().str.contains(text, na=False)]
+    if asset_status_filter.value != "All" and "status" in df.columns:
+        df = df[df["status"] == asset_status_filter.value]
+    if asset_condition_filter.value != "All" and "condition" in df.columns:
+        df = df[df["condition"] == asset_condition_filter.value]
+    return df
+
+
+asset_registry_tabulator = pn.widgets.Tabulator(
+    _filtered_asset_registry(),
+    pagination="remote",
+    page_size=15,
+    height=400,
+    show_index=False,
+)
+
+
+def _refresh_asset_registry(event=None):
+    asset_registry_tabulator.value = _filtered_asset_registry()
+
+
+asset_search_widget.param.watch(_refresh_asset_registry, "value")
+asset_status_filter.param.watch(_refresh_asset_registry, "value")
+asset_condition_filter.param.watch(_refresh_asset_registry, "value")
+
+asset_registry_download = pn.widgets.FileDownload(
+    callback=lambda: csv_bytes(build_asset_registry()),
+    filename="chinhoyi_streetlight_asset_registry.csv",
+    label="📄 Export Asset Registry CSV",
+    button_type="success",
+)
+
 
 @pn.depends()
 def asset_monitor_view() -> pn.Column:
@@ -3047,6 +3545,19 @@ def asset_monitor_view() -> pn.Column:
     else:
         summary = pd.DataFrame(columns=["Status", "Assets", "Percentage"])
 
+    registry = build_asset_registry()
+    condition_counts = (
+        registry["condition"].value_counts()
+        if not registry.empty and "condition" in registry.columns
+        else pd.Series(dtype=int)
+    )
+
+    def cond_card(label, accent):
+        return pn.pane.HTML(
+            kpi_card(label, f"{int(condition_counts.get(label, 0)):,}", "assets", accent),
+            sizing_mode="stretch_width",
+        )
+
     return pn.Column(
         pn.pane.Markdown(
             """
@@ -3062,6 +3573,29 @@ network.
             show_index=False,
             height=220,
         ),
+        pn.layout.Divider(),
+        pn.pane.Markdown(
+            "### 🗂️ Asset Registry\n\n"
+            "Every existing streetlight with ID, location, type, installation "
+            "date, age, operational status, and a derived condition rating."
+        ),
+        pn.Row(
+            cond_card("Good", COLOR_LOW),
+            cond_card("Fair", COLOR_MED),
+            cond_card("Poor", COLOR_HIGH),
+            cond_card("Critical", COLOR_FAULT),
+            sizing_mode="stretch_width",
+        ),
+        pn.Row(
+            asset_search_widget,
+            asset_status_filter,
+            asset_condition_filter,
+            sizing_mode="stretch_width",
+        ),
+        asset_registry_tabulator,
+        asset_registry_download,
+        pn.layout.Divider(),
+        pn.pane.Markdown("### 🛠️ Maintenance Editor"),
         maintenance_tabulator,
         save_maintenance_button,
         sizing_mode="stretch_width",
@@ -3189,6 +3723,40 @@ synchronisation into a municipal work-order database.
 # DATA QUALITY / SYSTEM TAB
 # ---------------------------------------------------------------------
 
+def _quality_score_card() -> pn.pane.HTML:
+    q = data_quality_score()
+    accent = (
+        COLOR_LOW if q["overall_pct"] >= 80
+        else COLOR_MED if q["overall_pct"] >= 50
+        else COLOR_HIGH
+    )
+    return pn.pane.HTML(
+        f"""
+        <div style="
+          background:white;border:1px solid #e2e8f0;border-radius:10px;
+          padding:16px;display:flex;gap:28px;flex-wrap:wrap;align-items:center;">
+          <div>
+            <div style="font-size:11px;color:#64748b;text-transform:uppercase;">
+              Overall Data Quality
+            </div>
+            <div style="font-size:34px;font-weight:800;color:{accent};">
+              {q['overall_pct']:.1f}%
+            </div>
+          </div>
+          <div style="font-size:12px;color:#334155;line-height:1.6;">
+            <b>{q['available_layers']}/{q['total_layers']}</b> recognised layers available &middot;
+            <b>{q['n_lights']}</b> streetlight records &middot;
+            <b>{q['duplicate_ids']}</b> duplicate asset IDs &middot;
+            <b>{q['missing_ids']}</b> missing asset IDs &middot;
+            <b>{q['null_geoms']}</b> null geometries<br>
+            {"⚠️ Running with demo/synthetic fallback layers -- this score will rise once real municipal data is loaded." if q['is_demo'] else "✅ Core real-data layers are in place."}
+          </div>
+        </div>
+        """,
+        sizing_mode="stretch_width",
+    )
+
+
 data_quality_tab = pn.Column(
     pn.pane.Markdown(
         """
@@ -3207,6 +3775,7 @@ after each dataset has been checked for:
 - metadata and update frequency
 """
     ),
+    pn.bind(_quality_score_card),
     pn.widgets.Tabulator(
         source_status_table(),
         height=450,
@@ -3301,6 +3870,164 @@ priority class and implementation fields.
 - PDF map/report generated from the final validated dataset
 """
     ),
+    sizing_mode="stretch_width",
+)
+
+
+# ---------------------------------------------------------------------
+# WHAT-IF PLANNING TOOL
+# ---------------------------------------------------------------------
+#
+# Lets a planner ask: "What happens if we install N new solar streetlights?"
+# Selects the top-N ranked candidates from the current MCDA scenario and
+# reports the simulated coverage improvement, share of high-priority
+# demand addressed, estimated cost, and remaining high-priority sites --
+# all computed from the same pipeline as the rest of the dashboard.
+
+what_if_n_selector = pn.widgets.RadioButtonGroup(
+    name="Number of new lights",
+    options=["10", "25", "50", "100", "Custom"],
+    value="25",
+    button_type="primary",
+)
+
+what_if_custom_n = pn.widgets.IntInput(
+    name="Custom number of lights",
+    value=25,
+    start=1,
+    end=2000,
+    visible=False,
+)
+
+
+def _toggle_custom_n(event):
+    what_if_custom_n.visible = (event.new == "Custom")
+
+
+what_if_n_selector.param.watch(_toggle_custom_n, "value")
+
+
+def _resolve_n_lights() -> int:
+    if what_if_n_selector.value == "Custom":
+        return int(what_if_custom_n.value)
+    return int(what_if_n_selector.value)
+
+
+def what_if_analysis(n_lights: int) -> Dict[str, object]:
+    scored = get_candidate_dataset()
+    n_lights = max(0, min(n_lights, len(scored)))
+
+    top_n = scored.head(n_lights)
+
+    baseline_coverage = coverage_percentage(
+        DATA.streetlights, DATA.population, COVERAGE_RADIUS.value
+    )
+
+    combined_lights = combined_light_points(DATA.streetlights, top_n)
+    projected_coverage = coverage_percentage(
+        combined_lights, DATA.population, COVERAGE_RADIUS.value
+    )
+
+    total_high = int(scored["priority_class"].isin(["VERY HIGH", "HIGH"]).sum())
+    addressed_high = int(top_n["priority_class"].isin(["VERY HIGH", "HIGH"]).sum())
+    pct_high_addressed = (
+        round(100.0 * addressed_high / total_high, 1) if total_high else 0.0
+    )
+    remaining_high = max(total_high - addressed_high, 0)
+
+    unit_cost = float(unit_cost_widget.value) * (1 + float(contingency_widget.value) / 100)
+    estimated_cost = round(unit_cost * n_lights, 2)
+
+    return {
+        "n_lights": n_lights,
+        "baseline_coverage_pct": round(baseline_coverage, 1),
+        "projected_coverage_pct": round(projected_coverage, 1),
+        "coverage_improvement_pct": round(projected_coverage - baseline_coverage, 1),
+        "total_high_priority": total_high,
+        "high_priority_addressed": addressed_high,
+        "pct_high_priority_addressed": pct_high_addressed,
+        "remaining_high_priority": remaining_high,
+        "estimated_cost": estimated_cost,
+    }
+
+
+@pn.depends(
+    what_if_n_selector.param.value,
+    what_if_custom_n.param.value,
+    COVERAGE_RADIUS.param.value,
+    CANDIDATE_SPACING.param.value,
+    MAX_CANDIDATES.param.value,
+    scenario_widget.param.value,
+    unit_cost_widget.param.value,
+    contingency_widget.param.value,
+)
+def what_if_results_view(*_) -> pn.Column:
+    n_lights = _resolve_n_lights()
+    result = what_if_analysis(n_lights)
+
+    def card(title, value, subtitle="", accent=COLOR_CUT_NAVY):
+        return pn.pane.HTML(
+            kpi_card(title, value, subtitle, accent),
+            sizing_mode="stretch_width",
+        )
+
+    return pn.Column(
+        pn.Row(
+            card("New Lights Simulated", f"{result['n_lights']:,}"),
+            card(
+                "Coverage After",
+                f"{result['projected_coverage_pct']:.1f}%",
+                f"was {result['baseline_coverage_pct']:.1f}% before "
+                f"({result['coverage_improvement_pct']:+.1f} pts)",
+                COLOR_INFO,
+            ),
+            card(
+                "High-Priority Addressed",
+                f"{result['pct_high_priority_addressed']:.1f}%",
+                f"{result['high_priority_addressed']} of {result['total_high_priority']} sites",
+                COLOR_HIGH,
+            ),
+            card(
+                "Remaining High-Priority",
+                f"{result['remaining_high_priority']:,}",
+                "sites still unaddressed",
+                COLOR_MED,
+            ),
+            card(
+                "Estimated Cost",
+                f"${result['estimated_cost']:,.0f}",
+                "incl. contingency, current unit cost",
+                COLOR_MUNI_GREEN,
+            ),
+            sizing_mode="stretch_width",
+        ),
+        pn.pane.Markdown(
+            "*Simulation selects the top-ranked candidates under the current "
+            "scenario/weights and re-runs the coverage calculation as if they "
+            "were installed alongside existing streetlights. This does not "
+            "modify your actual data -- it is a planning simulation only.*",
+            styles={"font-size": "11px", "color": "#64748b"},
+        ),
+        sizing_mode="stretch_width",
+    )
+
+
+what_if_tab = pn.Column(
+    pn.pane.Markdown(
+        """
+## 🔮 What-If Planning Tool
+
+Answer the question: **"What happens if we install N new solar streetlights?"**
+
+Pick a number below (or enter a custom value) to simulate the coverage
+improvement, share of high-priority demand addressed, and estimated cost
+under the currently selected planning scenario.
+"""
+    ),
+    what_if_n_selector,
+    what_if_custom_n,
+    pn.layout.Divider(),
+    what_if_results_view,
     sizing_mode="stretch_width",
 )
 
@@ -3402,9 +4129,11 @@ class DashboardAssistant:
         counts = scored["priority_class"].value_counts()
         return (
             f"Of {len(scored)} candidate sites under the current scenario: "
+            f"{int(counts.get('VERY HIGH', 0))} VERY HIGH, "
             f"{int(counts.get('HIGH', 0))} HIGH, "
-            f"{int(counts.get('MEDIUM', 0))} MEDIUM, "
-            f"{int(counts.get('LOW', 0))} LOW priority."
+            f"{int(counts.get('MODERATE', 0))} MODERATE, "
+            f"{int(counts.get('LOW', 0))} LOW, and "
+            f"{int(counts.get('UNSUITABLE', 0))} UNSUITABLE."
         )
 
     def top_site(self) -> str:
@@ -3625,6 +4354,7 @@ application = pn.template.FastListTemplate(
             ("⚖️ AHP / MCDA", weights_panel),
             ("🔧 Asset & Maintenance", asset_monitor_view),
             ("💰 Budget & Phasing", budget_view),
+            ("🔮 What-If Planning", what_if_tab),
             ("👥 Community Reporting", community_tab),
             ("🧪 Data Readiness", data_quality_tab),
             ("📤 Export", export_tab),
