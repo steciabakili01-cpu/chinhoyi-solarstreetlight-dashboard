@@ -14,4 +14,4 @@ COPY . .
 
 EXPOSE 7860
 
-CMD ["panel", "serve", "gis_script.py", "--address", "0.0.0.0", "--port", "7860", "--allow-websocket-origin=*"]
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
