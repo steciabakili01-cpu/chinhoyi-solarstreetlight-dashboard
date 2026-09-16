@@ -2,7 +2,9 @@ streamlit
 pandas
 geopandas
 folium
-panel
+streamlit-folium
+shapely
+fiona
 
 from src.data_loader import load_geojson_data
 from src.spatial_analysis import create_coverage_buffers, calculate_priority_score
