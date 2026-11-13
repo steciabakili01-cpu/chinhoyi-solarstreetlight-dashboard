@@ -1,17 +1,19 @@
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libgdal-dev \
-    && rm -rf /var/lib/apt/lists/*
-
+# Install Python dependencies, including the GIS libraries.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
+# Copy the dashboard source and its data/assets folders.
 COPY . .
 
-EXPOSE 7860
+# Render provides PORT at runtime; app.py reads it in server_config().
+EXPOSE 10000
 
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["python", "app.py"]
